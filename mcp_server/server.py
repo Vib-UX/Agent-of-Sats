@@ -125,6 +125,8 @@ async def get_status() -> dict[str, Any]:
         "agent": "Agent of Sats",
         "hyperliquid_connected": connected,
         "hyperliquid_network": hl_client.cfg.network,
+        "hyperliquid_address": hl_client.cfg.wallet_address or None,
+        "can_trade": hl_client.cfg.can_trade,
         "last_pnl_snapshot_ts": snapshot["ts"] if snapshot else None,
         "last_pnl_snapshot_iso": snapshot["iso"] if snapshot else None,
     }
@@ -133,14 +135,15 @@ async def get_status() -> dict[str, Any]:
 @mcp.tool()
 async def get_pnl_snapshot(window_24h: bool = True, window_7d: bool = True) -> dict[str, Any]:
     """
-    Return cumulative PnL, windowed realized PnL, max drawdown, and open positions.
+    Return cumulative PnL, windowed realized PnL, max drawdown, open positions,
+    and account margin summary from Hyperliquid.
     """
     assert hl_client and perf_log
 
     summary_24h = await perf_log.compute_pnl_summary(window_hours=24) if window_24h else None
     summary_7d = await perf_log.compute_pnl_summary(window_hours=168) if window_7d else None
 
-    positions = await hl_client.get_positions()
+    account = await hl_client.get_account_summary()
     pos_list = [
         {
             "symbol": p.symbol,
@@ -149,11 +152,19 @@ async def get_pnl_snapshot(window_24h: bool = True, window_7d: bool = True) -> d
             "mark_price": p.mark_price,
             "unrealized_pnl": p.unrealized_pnl,
             "leverage": p.leverage,
+            "margin_used": p.margin_used,
+            "liquidation_price": p.liquidation_price,
         }
-        for p in positions
+        for p in account.positions
     ]
 
     result: dict[str, Any] = {
+        "account": {
+            "value_usd": account.account_value,
+            "total_notional": account.total_ntl_pos,
+            "margin_used": account.total_margin_used,
+            "withdrawable": account.withdrawable,
+        },
         "open_positions": pos_list,
     }
     if summary_24h:
@@ -161,7 +172,7 @@ async def get_pnl_snapshot(window_24h: bool = True, window_7d: bool = True) -> d
     if summary_7d:
         result["pnl_7d"] = summary_7d
 
-    # Also persist a snapshot event
+    # Persist a snapshot event
     await perf_log.append_event({
         "type": EVENT_PNL_SNAPSHOT,
         "payload": result,
@@ -227,11 +238,10 @@ async def run_basis_strategy(
 
     # 4. Place the order
     try:
-        order = await hl_client.place_order(
+        order = await hl_client.market_open(
             symbol="BTC",
             is_buy=is_buy,
             size=size_btc,
-            order_type="market",
         )
         decision["action"] = "order_placed"
         decision["order_id"] = order.order_id

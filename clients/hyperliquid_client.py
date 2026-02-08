@@ -1,12 +1,17 @@
 """
 Hyperliquid perps client for Agent of Sats.
 
-Wraps the Hyperliquid REST/SDK to provide:
-  • BTC perp market info (price, funding)
-  • Position queries
-  • Order placement (market / limit)
-  • Bulk position closure
+Uses the official ``hyperliquid-python-sdk`` for all market data and
+trading operations.
 
+Components:
+    Info     – read-only: market data, positions, orders, fills
+    Exchange – write: place/cancel orders, set leverage, market open/close
+
+Configuration via env vars:
+    HYPERLIQUID_WALLET_ADDRESS – your 0x address (required for read ops)
+    HYPERLIQUID_PRIVATE_KEY    – hex private key (required for write ops)
+    HYPERLIQUID_NETWORK        – "mainnet" (default) or "testnet"
 """
 
 from __future__ import annotations
@@ -17,33 +22,57 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
+from eth_account import Account as EthAccount
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+from hyperliquid.utils import constants
 
 logger = logging.getLogger("agent_of_sats.hyperliquid")
 
 # ── Configuration ───────────────────────────────────────────────────────────
-
-MAINNET_API = "https://api.hyperliquid.xyz"
-TESTNET_API = "https://api.hyperliquid-testnet.xyz"
 
 BTC_SYMBOL = "BTC"
 
 
 @dataclass
 class HyperliquidConfig:
+    wallet_address: str = ""
     private_key: str = ""
-    network: str = "testnet"  # "mainnet" | "testnet"
-    api_url: str = ""
+    network: str = ""
 
     def __post_init__(self):
-        if not self.private_key:
-            self.private_key = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
-        if not self.network:
-            self.network = os.getenv("HYPERLIQUID_NETWORK", "testnet")
-        if not self.api_url:
-            self.api_url = (
-                MAINNET_API if self.network == "mainnet" else TESTNET_API
-            )
+        self.wallet_address = self.wallet_address or os.getenv(
+            "HYPERLIQUID_WALLET_ADDRESS", ""
+        )
+        self.private_key = self.private_key or os.getenv(
+            "HYPERLIQUID_PRIVATE_KEY", ""
+        )
+        self.network = self.network or os.getenv(
+            "HYPERLIQUID_NETWORK", "mainnet"
+        )
+
+        # Derive address from private key if address not provided
+        if self.private_key and not self.wallet_address:
+            key = self.private_key
+            if not key.startswith("0x"):
+                key = "0x" + key
+            self.wallet_address = EthAccount.from_key(key).address
+
+    @property
+    def base_url(self) -> str:
+        return (
+            constants.MAINNET_API_URL
+            if self.network == "mainnet"
+            else constants.TESTNET_API_URL
+        )
+
+    @property
+    def can_read(self) -> bool:
+        return bool(self.wallet_address)
+
+    @property
+    def can_trade(self) -> bool:
+        return bool(self.private_key)
 
 
 # ── Data classes ────────────────────────────────────────────────────────────
@@ -56,6 +85,8 @@ class MarketInfo:
     index_price: float
     funding_rate: float  # current 8-hour rate
     open_interest: float
+    day_ntl_vlm: float = 0.0
+    premium: float = 0.0
     raw: dict = field(default_factory=dict)
 
 
@@ -67,7 +98,18 @@ class Position:
     mark_price: float
     unrealized_pnl: float
     leverage: float
+    margin_used: float = 0.0
     liquidation_price: float | None = None
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class AccountSummary:
+    account_value: float
+    total_ntl_pos: float
+    total_margin_used: float
+    withdrawable: float
+    positions: list[Position] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
 
@@ -83,137 +125,280 @@ class OrderResult:
     raw: dict = field(default_factory=dict)
 
 
+@dataclass
+class Fill:
+    symbol: str
+    side: str
+    size: float
+    price: float
+    fee: float
+    time: str
+    raw: dict = field(default_factory=dict)
+
+
 # ── Client ──────────────────────────────────────────────────────────────────
 
 
 class HyperliquidPerpsClient:
     """
-    Thin wrapper around the Hyperliquid Info and Exchange APIs.
+    Wrapper around the official Hyperliquid Python SDK.
 
-    For the hackathon build we use raw HTTP via httpx; a future iteration
-    should swap to the official ``hyperliquid-python-sdk`` once auth is
-    wired up.
+    Provides:
+        - Market data (prices, funding, order book)
+        - Account state (positions, margin, P&L)
+        - Order management (market open/close, limit, cancel)
+        - Leverage management
     """
 
     def __init__(self, config: HyperliquidConfig | None = None):
         self.cfg = config or HyperliquidConfig()
-        self._http = httpx.AsyncClient(
-            base_url=self.cfg.api_url,
-            timeout=15.0,
-        )
-        self._mock = not self.cfg.private_key
-        if self._mock:
+
+        # Info client (read-only, always available)
+        self._info = Info(self.cfg.base_url, skip_ws=True)
+
+        # Exchange client (write ops, needs private key)
+        self._exchange: Exchange | None = None
+        if self.cfg.can_trade:
+            key = self.cfg.private_key
+            if not key.startswith("0x"):
+                key = "0x" + key
+            wallet = EthAccount.from_key(key)
+            self._exchange = Exchange(wallet, self.cfg.base_url)
+            logger.info(
+                "Hyperliquid client ready (read+write) on %s for %s",
+                self.cfg.network,
+                self.cfg.wallet_address,
+            )
+        elif self.cfg.can_read:
+            logger.info(
+                "Hyperliquid client ready (read-only) on %s for %s",
+                self.cfg.network,
+                self.cfg.wallet_address,
+            )
+        else:
             logger.warning(
-                "HYPERLIQUID_PRIVATE_KEY not set – running in read-only mock mode"
+                "Hyperliquid client has no wallet address — limited to public market data"
             )
 
-    # ── public: market data ─────────────────────────────────────────────
+        # Cache meta on init for name→asset mapping
+        self._meta: dict | None = None
+
+    # ─── Market Data ────────────────────────────────────────────────────
 
     async def get_btc_market_info(self) -> MarketInfo:
         """Fetch BTC perp mark/index prices and current funding rate."""
-        if self._mock:
-            return self._mock_market_info()
+        return await self.get_market_info(BTC_SYMBOL)
 
-        try:
-            # Hyperliquid info endpoint
-            resp = await self._http.post(
-                "/info",
-                json={"type": "metaAndAssetCtxs"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+    async def get_market_info(self, symbol: str = "BTC") -> MarketInfo:
+        """Fetch perp market info for any symbol."""
+        data = self._info.meta_and_asset_ctxs()
+        meta = data[0]
+        asset_ctxs = data[1]
 
-            # data is [meta, [assetCtx, ...]]
-            meta = data[0]
-            asset_ctxs = data[1]
+        idx = None
+        for i, asset in enumerate(meta.get("universe", [])):
+            if asset.get("name") == symbol:
+                idx = i
+                break
 
-            # Find BTC index
-            btc_idx = None
-            for i, asset in enumerate(meta.get("universe", [])):
-                if asset.get("name") == BTC_SYMBOL:
-                    btc_idx = i
-                    break
+        if idx is None or idx >= len(asset_ctxs):
+            raise ValueError(f"{symbol} not found in Hyperliquid universe")
 
-            if btc_idx is None or btc_idx >= len(asset_ctxs):
-                raise ValueError("BTC not found in Hyperliquid universe")
+        ctx = asset_ctxs[idx]
+        mark = float(ctx.get("markPx", 0))
+        oracle = float(ctx.get("oraclePx", 0))
 
-            ctx = asset_ctxs[btc_idx]
-            return MarketInfo(
-                symbol=BTC_SYMBOL,
-                mark_price=float(ctx.get("markPx", 0)),
-                index_price=float(ctx.get("oraclePx", 0)),
-                funding_rate=float(ctx.get("funding", 0)),
-                open_interest=float(ctx.get("openInterest", 0)),
-                raw=ctx,
-            )
-        except Exception as exc:
-            logger.error("Failed to fetch BTC market info: %s", exc)
-            raise
+        return MarketInfo(
+            symbol=symbol,
+            mark_price=mark,
+            index_price=oracle,
+            funding_rate=float(ctx.get("funding", 0)),
+            open_interest=float(ctx.get("openInterest", 0)),
+            day_ntl_vlm=float(ctx.get("dayNtlVlm", 0)),
+            premium=float(ctx.get("premium", 0)),
+            raw=ctx,
+        )
 
-    async def get_positions(self, user_address: str | None = None) -> list[Position]:
-        """Return open perp positions for the configured wallet."""
-        if self._mock:
-            return self._mock_positions()
+    async def get_all_mids(self) -> dict[str, float]:
+        """Get mid prices for all perp markets."""
+        mids = self._info.all_mids()
+        return {k: float(v) for k, v in mids.items()}
 
-        try:
-            # TODO: derive address from private key if user_address not provided
-            address = user_address or "0x0000000000000000000000000000000000000000"
-            resp = await self._http.post(
-                "/info",
-                json={"type": "clearinghouseState", "user": address},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+    async def get_orderbook(self, symbol: str = "BTC") -> dict[str, Any]:
+        """Get L2 order book snapshot for a symbol."""
+        return self._info.l2_snapshot(symbol)
 
-            positions: list[Position] = []
-            for pos in data.get("assetPositions", []):
-                p = pos.get("position", {})
-                size = float(p.get("szi", 0))
-                if size == 0:
-                    continue
-                positions.append(
-                    Position(
-                        symbol=p.get("coin", ""),
-                        size=size,
-                        entry_price=float(p.get("entryPx", 0)),
-                        mark_price=float(p.get("markPx", 0)),  # may not be in this response
-                        unrealized_pnl=float(p.get("unrealizedPnl", 0)),
-                        leverage=float(p.get("leverage", {}).get("value", 1)),
-                        liquidation_price=float(p.get("liquidationPx", 0)) if p.get("liquidationPx") else None,
-                        raw=p,
-                    )
+    # ─── Account / Positions ────────────────────────────────────────────
+
+    async def get_account_summary(self) -> AccountSummary:
+        """Get full account state: margin, positions, withdrawable."""
+        self._require_address()
+        state = self._info.user_state(self.cfg.wallet_address)
+
+        margin = state.get("crossMarginSummary", state.get("marginSummary", {}))
+        positions = []
+
+        for ap in state.get("assetPositions", []):
+            p = ap.get("position", {})
+            sz = float(p.get("szi", 0))
+            if sz == 0:
+                continue
+            positions.append(
+                Position(
+                    symbol=p.get("coin", ""),
+                    size=sz,
+                    entry_price=float(p.get("entryPx", 0)),
+                    mark_price=float(p.get("markPx", 0)) if p.get("markPx") else 0,
+                    unrealized_pnl=float(p.get("unrealizedPnl", 0)),
+                    leverage=float(
+                        p.get("leverage", {}).get("value", 1)
+                        if isinstance(p.get("leverage"), dict)
+                        else p.get("leverage", 1)
+                    ),
+                    margin_used=float(p.get("marginUsed", 0)),
+                    liquidation_price=(
+                        float(p["liquidationPx"])
+                        if p.get("liquidationPx")
+                        else None
+                    ),
+                    raw=p,
                 )
-            return positions
-        except Exception as exc:
-            logger.error("Failed to get positions: %s", exc)
-            raise
+            )
 
-    # ── public: trading ─────────────────────────────────────────────────
+        return AccountSummary(
+            account_value=float(margin.get("accountValue", 0)),
+            total_ntl_pos=float(margin.get("totalNtlPos", 0)),
+            total_margin_used=float(margin.get("totalMarginUsed", 0)),
+            withdrawable=float(state.get("withdrawable", 0)),
+            positions=positions,
+            raw=state,
+        )
 
-    async def place_order(
+    async def get_positions(self) -> list[Position]:
+        """Return open perp positions for the configured wallet."""
+        summary = await self.get_account_summary()
+        return summary.positions
+
+    async def get_open_orders(self) -> list[dict[str, Any]]:
+        """Return open orders for the configured wallet."""
+        self._require_address()
+        return self._info.open_orders(self.cfg.wallet_address)
+
+    async def get_fills(self, limit: int = 50) -> list[Fill]:
+        """Return recent fills for the configured wallet."""
+        self._require_address()
+        raw_fills = self._info.user_fills(self.cfg.wallet_address)
+        fills = []
+        for f in raw_fills[:limit]:
+            fills.append(
+                Fill(
+                    symbol=f.get("coin", ""),
+                    side=f.get("side", ""),
+                    size=float(f.get("sz", 0)),
+                    price=float(f.get("px", 0)),
+                    fee=float(f.get("fee", 0)),
+                    time=f.get("time", ""),
+                    raw=f,
+                )
+            )
+        return fills
+
+    async def get_funding_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return funding payment history for the configured wallet."""
+        self._require_address()
+        return self._info.user_funding_history(
+            self.cfg.wallet_address, 0, int(time.time() * 1000)
+        )[:limit]
+
+    # ─── Trading (requires private key) ─────────────────────────────────
+
+    async def market_open(
         self,
         symbol: str,
         is_buy: bool,
         size: float,
-        price: float | None = None,
-        order_type: str = "market",
-        reduce_only: bool = False,
+        slippage: float = 0.05,
     ) -> OrderResult:
         """
-        Place a market or limit order.
+        Open a position with a market order.
 
-        TODO: implement real signing with HYPERLIQUID_PRIVATE_KEY via the SDK.
+        Uses the SDK's ``market_open`` which handles slippage-adjusted
+        limit price internally.
         """
-        if self._mock:
-            return self._mock_order(symbol, is_buy, size, price, order_type)
+        self._require_exchange()
 
-        # TODO: Real order placement using hyperliquid-python-sdk
-        # from hyperliquid.exchange import Exchange
-        # exchange = Exchange(wallet, base_url)
-        # result = exchange.order(symbol, is_buy, size, price, ...)
-        raise NotImplementedError(
-            "Live order placement requires HYPERLIQUID_PRIVATE_KEY and SDK wiring. "
-            "Set the key and implement the Exchange wrapper."
+        result = self._exchange.market_open(  # type: ignore
+            name=symbol,
+            is_buy=is_buy,
+            sz=size,
+            slippage=slippage,
+        )
+
+        return self._parse_order_result(result, symbol, is_buy, size, "market_open")
+
+    async def market_close(
+        self,
+        symbol: str,
+        size: float | None = None,
+        slippage: float = 0.05,
+    ) -> OrderResult:
+        """
+        Close a position (or partial) with a market order.
+
+        If *size* is None, closes the entire position.
+        """
+        self._require_exchange()
+
+        result = self._exchange.market_close(  # type: ignore
+            coin=symbol,
+            sz=size,
+            slippage=slippage,
+        )
+
+        return self._parse_order_result(
+            result, symbol, None, size or 0, "market_close"
+        )
+
+    async def limit_order(
+        self,
+        symbol: str,
+        is_buy: bool,
+        size: float,
+        price: float,
+        reduce_only: bool = False,
+    ) -> OrderResult:
+        """Place a limit order (GTC)."""
+        self._require_exchange()
+
+        order_type = {"limit": {"tif": "Gtc"}}
+        result = self._exchange.order(  # type: ignore
+            name=symbol,
+            is_buy=is_buy,
+            sz=size,
+            limit_px=price,
+            order_type=order_type,
+            reduce_only=reduce_only,
+        )
+
+        return self._parse_order_result(result, symbol, is_buy, size, "limit")
+
+    async def cancel_order(self, symbol: str, order_id: int) -> dict[str, Any]:
+        """Cancel an open order by OID."""
+        self._require_exchange()
+        return self._exchange.cancel(name=symbol, oid=order_id)  # type: ignore
+
+    async def set_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        is_cross: bool = True,
+    ) -> dict[str, Any]:
+        """Set leverage for a symbol (cross or isolated)."""
+        self._require_exchange()
+        return self._exchange.update_leverage(  # type: ignore
+            leverage=leverage,
+            name=symbol,
+            is_cross=is_cross,
         )
 
     async def close_all_positions(self, symbol: str) -> list[OrderResult]:
@@ -223,78 +408,89 @@ class HyperliquidPerpsClient:
         for pos in positions:
             if pos.symbol != symbol:
                 continue
-            # Close by reversing direction
-            is_buy = pos.size < 0  # short → buy to close
-            result = await self.place_order(
-                symbol=symbol,
-                is_buy=is_buy,
-                size=abs(pos.size),
-                order_type="market",
-                reduce_only=True,
-            )
+            result = await self.market_close(symbol=symbol, size=abs(pos.size))
             results.append(result)
         return results
 
-    # ── connectivity check ──────────────────────────────────────────────
+    # ─── Connectivity ───────────────────────────────────────────────────
 
     async def is_connected(self) -> bool:
-        """Quick health check – can we reach the API?"""
+        """Quick health check – can we reach the Hyperliquid API?"""
         try:
-            resp = await self._http.post(
-                "/info",
-                json={"type": "meta"},
-            )
-            return resp.status_code == 200
+            self._info.meta()
+            return True
         except Exception:
             return False
 
-    # ── cleanup ─────────────────────────────────────────────────────────
+    # ─── Cleanup ────────────────────────────────────────────────────────
 
     async def close(self) -> None:
-        await self._http.aclose()
+        """Disconnect any websocket connections."""
+        try:
+            self._info.disconnect_websocket()
+        except Exception:
+            pass
 
-    # ── mock helpers (dev / demo mode) ──────────────────────────────────
+    # ─── Internal helpers ───────────────────────────────────────────────
 
-    @staticmethod
-    def _mock_market_info() -> MarketInfo:
-        return MarketInfo(
-            symbol=BTC_SYMBOL,
-            mark_price=97_250.50,
-            index_price=97_245.00,
-            funding_rate=0.0001,  # 0.01 % per 8h
-            open_interest=125_000_000.0,
-            raw={"mock": True},
-        )
-
-    @staticmethod
-    def _mock_positions() -> list[Position]:
-        return [
-            Position(
-                symbol=BTC_SYMBOL,
-                size=-0.15,
-                entry_price=97_100.00,
-                mark_price=97_250.50,
-                unrealized_pnl=-22.58,
-                leverage=3.0,
-                raw={"mock": True},
+    def _require_address(self) -> None:
+        if not self.cfg.wallet_address:
+            raise RuntimeError(
+                "HYPERLIQUID_WALLET_ADDRESS is required for account queries. "
+                "Set it in .env or pass it in HyperliquidConfig."
             )
-        ]
+
+    def _require_exchange(self) -> None:
+        if self._exchange is None:
+            raise RuntimeError(
+                "HYPERLIQUID_PRIVATE_KEY is required for trading operations. "
+                "Set it in .env or pass it in HyperliquidConfig."
+            )
 
     @staticmethod
-    def _mock_order(
+    def _parse_order_result(
+        result: Any,
         symbol: str,
-        is_buy: bool,
+        is_buy: bool | None,
         size: float,
-        price: float | None,
         order_type: str,
     ) -> OrderResult:
+        """Parse the SDK's order response into our OrderResult dataclass."""
+        status_data = result.get("response", result) if isinstance(result, dict) else {}
+        data = status_data.get("data", {}) if isinstance(status_data, dict) else {}
+
+        # The SDK returns nested structures — try to extract order info
+        statuses = data.get("statuses", []) if isinstance(data, dict) else []
+        order_id = ""
+        order_status = "unknown"
+
+        if statuses and isinstance(statuses[0], dict):
+            filled = statuses[0].get("filled", statuses[0].get("resting", {}))
+            if isinstance(filled, dict):
+                order_id = str(filled.get("oid", ""))
+            elif isinstance(statuses[0], dict) and "error" in statuses[0]:
+                order_status = "error"
+                order_id = statuses[0].get("error", "")
+            else:
+                order_id = str(statuses[0])
+                order_status = "filled" if "filled" in str(statuses[0]).lower() else "submitted"
+
+        if order_id and order_status == "unknown":
+            order_status = "submitted"
+
+        side = "unknown"
+        if is_buy is True:
+            side = "buy"
+        elif is_buy is False:
+            side = "sell"
+
         return OrderResult(
-            order_id=f"mock-{int(time.time()*1000)}",
+            order_id=order_id,
             symbol=symbol,
-            side="buy" if is_buy else "sell",
+            side=side,
             size=size,
-            price=price or 97_250.50,
+            price=None,
             order_type=order_type,
-            status="filled",
-            raw={"mock": True},
+            status=order_status,
+            raw=result if isinstance(result, dict) else {"raw": str(result)},
         )
