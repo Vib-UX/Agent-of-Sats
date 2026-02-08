@@ -341,32 +341,219 @@ async def share_pnl_to_moltbook(
 
 
 @mcp.tool()
-async def lifi_quote_and_stub_deposit(
-    chain_from: str = "ethereum",
-    chain_to: str = "arbitrum",
-    amount: float = 1000.0,
-    token: str = "USDC",
+async def lifi_get_quote(
+    from_chain: str = "ethereum",
+    to_chain: str = "arbitrum",
+    from_token: str = "USDC",
+    to_token: str = "USDC",
+    from_amount: str = "1000000",
+    from_address: str = "0x0000000000000000000000000000000000000000",
+    slippage: float = 0.005,
 ) -> dict[str, Any]:
     """
-    Get a Li.Fi cross-chain quote showing how a user would bridge funds
-    into/out of the Agent of Sats strategy universe.
+    Get a Li.Fi cross-chain transfer quote.
 
-    This is an integration stub – interfaces are real but execution is mocked.
+    Calls the live Li.Fi API to find the optimal route across 27+ bridges,
+    31+ DEXs, and intent-based solvers across 58+ blockchains.
+
+    Parameters:
+        from_chain   – source chain name or ID (e.g. "ethereum", "arbitrum", "base", 42161)
+        to_chain     – destination chain name or ID
+        from_token   – source token symbol or address (e.g. "USDC", "ETH", "0x...")
+        to_token     – destination token symbol or address
+        from_amount  – amount in smallest unit (e.g. "1000000" for 1 USDC)
+        from_address – sender wallet address (0x...)
+        slippage     – max slippage as decimal (default 0.005 = 0.5%)
     """
     assert lifi
 
-    quote = await lifi.get_quote(chain_from, chain_to, token, amount)
-    route = await lifi.build_route(chain_from, chain_to, token, amount)
+    try:
+        quote = await lifi.get_quote(
+            from_chain=from_chain,
+            to_chain=to_chain,
+            from_token=from_token,
+            to_token=to_token,
+            from_amount=from_amount,
+            from_address=from_address,
+            slippage=slippage,
+        )
 
-    return {
-        "quote": quote,
-        "route": route,
-        "note": (
-            "This is a stub deposit interface. In production, the agent "
-            "would execute the route to bridge funds into its Hyperliquid "
-            "margin account."
-        ),
-    }
+        # Extract the most useful fields for a concise response
+        action = quote.get("action", {})
+        estimate = quote.get("estimate", {})
+        tool_info = quote.get("tool", "")
+        has_tx = "transactionRequest" in quote
+
+        return {
+            "action": "quote_received",
+            "tool_used": tool_info,
+            "from": f"{action.get('fromToken', {}).get('symbol', from_token)} on {action.get('fromChainId', from_chain)}",
+            "to": f"{action.get('toToken', {}).get('symbol', to_token)} on {action.get('toChainId', to_chain)}",
+            "from_amount": action.get("fromAmount", from_amount),
+            "to_amount": estimate.get("toAmount", "N/A"),
+            "to_amount_min": estimate.get("toAmountMin", "N/A"),
+            "gas_costs_usd": sum(
+                float(g.get("amountUSD", 0))
+                for g in estimate.get("gasCosts", [])
+            ),
+            "fee_costs_usd": sum(
+                float(f.get("amountUSD", 0))
+                for f in estimate.get("feeCosts", [])
+            ),
+            "execution_duration_s": estimate.get("executionDuration", "N/A"),
+            "has_transaction_request": has_tx,
+            "full_quote": quote,
+        }
+    except Exception as exc:
+        return {
+            "action": "error",
+            "error": str(exc),
+            "hint": (
+                "Ensure from_amount is in smallest unit (e.g. 1000000 for 1 USDC). "
+                "Use lifi_get_chains() to list valid chain names/IDs."
+            ),
+        }
+
+
+@mcp.tool()
+async def lifi_get_routes(
+    from_chain: str = "ethereum",
+    to_chain: str = "arbitrum",
+    from_token: str = "USDC",
+    to_token: str = "USDC",
+    from_amount: str = "1000000",
+    from_address: str = "0x0000000000000000000000000000000000000000",
+) -> dict[str, Any]:
+    """
+    Get multiple route options for a cross-chain transfer via Li.Fi.
+
+    Compares different bridges and DEX paths. Useful to show users
+    cost/speed tradeoffs before executing.
+
+    Parameters are the same as lifi_get_quote.
+    """
+    assert lifi
+
+    try:
+        result = await lifi.get_routes(
+            from_chain=from_chain,
+            to_chain=to_chain,
+            from_token=from_token,
+            to_token=to_token,
+            from_amount=from_amount,
+            from_address=from_address,
+        )
+
+        routes = result.get("routes", [])
+        summaries = []
+        for i, route in enumerate(routes[:5]):  # top 5
+            steps = route.get("steps", [])
+            summaries.append({
+                "rank": i + 1,
+                "to_amount": route.get("toAmount", "N/A"),
+                "to_amount_min": route.get("toAmountMin", "N/A"),
+                "gas_usd": route.get("gasCostUSD", "N/A"),
+                "steps": len(steps),
+                "tags": route.get("tags", []),
+            })
+
+        return {
+            "action": "routes_received",
+            "route_count": len(routes),
+            "top_routes": summaries,
+            "full_result": result,
+        }
+    except Exception as exc:
+        return {"action": "error", "error": str(exc)}
+
+
+@mcp.tool()
+async def lifi_check_status(
+    tx_hash: str,
+    bridge: str = "",
+    from_chain: str = "",
+    to_chain: str = "",
+) -> dict[str, Any]:
+    """
+    Check the status of a cross-chain transfer via Li.Fi.
+
+    Status values: NOT_FOUND, PENDING, DONE, FAILED.
+    Substatus on DONE: COMPLETED, PARTIAL, REFUNDED.
+
+    Parameters:
+        tx_hash    – the source chain transaction hash
+        bridge     – bridge name (optional, improves lookup speed)
+        from_chain – source chain name or ID (optional)
+        to_chain   – destination chain name or ID (optional)
+    """
+    assert lifi
+
+    try:
+        status = await lifi.get_status(
+            tx_hash=tx_hash,
+            bridge=bridge or None,
+            from_chain=from_chain or None,
+            to_chain=to_chain or None,
+        )
+        return {
+            "status": status.get("status", "UNKNOWN"),
+            "substatus": status.get("substatus"),
+            "substatusMessage": status.get("substatusMessage"),
+            "sending_tx": status.get("sending", {}).get("txHash"),
+            "receiving_tx": status.get("receiving", {}).get("txHash"),
+            "bridge_used": status.get("tool"),
+            "full_status": status,
+        }
+    except Exception as exc:
+        return {"action": "error", "error": str(exc)}
+
+
+@mcp.tool()
+async def lifi_get_chains() -> dict[str, Any]:
+    """
+    List all EVM chains supported by Li.Fi.
+
+    Returns chain IDs, names, and native tokens. Useful to discover
+    valid values for lifi_get_quote's from_chain / to_chain parameters.
+    """
+    assert lifi
+
+    try:
+        result = await lifi.get_chains(chain_types="EVM")
+        chains = result if isinstance(result, list) else result.get("chains", result)
+        summary = [
+            {"id": c.get("id"), "key": c.get("key"), "name": c.get("name")}
+            for c in (chains if isinstance(chains, list) else [])
+        ]
+        return {
+            "action": "chains_listed",
+            "count": len(summary),
+            "chains": summary,
+        }
+    except Exception as exc:
+        return {"action": "error", "error": str(exc)}
+
+
+@mcp.tool()
+async def lifi_get_tools() -> dict[str, Any]:
+    """
+    List all bridges and DEX aggregators available through Li.Fi.
+    """
+    assert lifi
+
+    try:
+        result = await lifi.get_tools()
+        bridges = result.get("bridges", [])
+        exchanges = result.get("exchanges", [])
+        return {
+            "action": "tools_listed",
+            "bridge_count": len(bridges),
+            "exchange_count": len(exchanges),
+            "bridges": [b.get("key") for b in bridges],
+            "exchanges": [e.get("key") for e in exchanges],
+        }
+    except Exception as exc:
+        return {"action": "error", "error": str(exc)}
 
 
 @mcp.tool()
