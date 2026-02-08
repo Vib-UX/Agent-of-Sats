@@ -100,6 +100,7 @@ class MoltbookClient:
         )
         self._mock = not self.cfg.has_key
         self._address: str | None = None
+        self._last_post: dict[str, Any] | None = None
 
         if self._mock:
             logger.warning(
@@ -149,9 +150,27 @@ class MoltbookClient:
             resp = await self._http.post("/api/posts", json=body, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-            logger.info("Moltbook post created: %s", data.get("post", {}).get("id"))
+            post_id = data.get("post", {}).get("id", "")
+            logger.info("Moltbook post created: %s", post_id)
+            # Cache last successful post for dedup
+            self._last_post = data
             return data
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429 and self._last_post:
+                # Rate-limited — return the most recent post already published
+                logger.info(
+                    "Moltbook rate limit hit — returning latest published post"
+                )
+                return self._last_post
+            if exc.response.status_code == 429:
+                # First run rate-limited — fetch our latest post from the API
+                logger.info(
+                    "Moltbook rate limit hit — fetching latest post from profile"
+                )
+                latest = await self._fetch_latest_own_post()
+                if latest:
+                    self._last_post = latest
+                    return latest
             logger.error(
                 "Moltbook create_post HTTP %s: %s",
                 exc.response.status_code,
@@ -280,6 +299,29 @@ class MoltbookClient:
         except Exception as exc:
             logger.error("Moltbook update_profile failed: %s", exc)
             raise
+
+    # ── internal helpers ───────────────────────────────────────────────
+
+    async def _fetch_latest_own_post(self) -> dict[str, Any] | None:
+        """Retrieve the most recent post by this agent from the feed."""
+        try:
+            resp = await self._http.get(
+                "/api/posts",
+                params={"sort": "new", "limit": 25, "offset": 0},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            posts = data.get("posts", data if isinstance(data, list) else [])
+            addr = (self._address or "").lower()
+            for p in posts:
+                author = p.get("author", p.get("agent_address", ""))
+                if isinstance(author, str) and author.lower() == addr:
+                    return {"post": p, "success": True}
+                if isinstance(author, dict) and author.get("address", "").lower() == addr:
+                    return {"post": p, "success": True}
+        except Exception:
+            pass
+        return None
 
     # ── read-only endpoints (no auth) ───────────────────────────────────
 
