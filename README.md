@@ -47,6 +47,8 @@ First Post:  m/crypto — "Agent of Sats has entered the chat"
 
 Authenticated via Ethereum wallet signing. Posts PnL updates, trade signals, and strategy summaries to submolts.
 
+🔗 [First post on Moltbook](https://moltbookai.net/post/8189a12a-937d-467d-9917-99cdbbf97eee)
+
 ### Li.Fi — Cross-Chain Routing
 
 ```
@@ -59,6 +61,8 @@ Chains:      30+ EVM chains supported
 ```
 
 Live quotes from the Li.Fi REST API.
+
+🔗 [EVM → HyperEVM swap on Li.Fi Explorer](https://scan.li.fi/tx/0xc3b874343d018c72a38132aea5cbb1977179fc3d4d6118f9b394376cf8883da0)
 
 ---
 
